@@ -1,0 +1,336 @@
+name: Linux Desktop 6h (Tailscale + xrdp)
+
+# ---------------------------------------------------------------------------
+#  دسکتاپ لینوکس (XFCE) برای ۶ ساعت — تک جاب
+#  نسخهٔ با ورود root در صفحهٔ لاگین xrdp.
+#
+#  Secretهای لازم:
+#    - RDP_PASSWORD    (کاربر rdpuser، حداقل ۱۲ کاراکتر)
+#    - ROOT_PASSWORD   (کاربر root، حداقل ۱۲ کاراکتر — ترجیحاً ۲۴+)
+#    - TAILSCALE_AUTHKEY
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "مدت روشن ماندن (دقیقه) — حداکثر ۳۵۰"
+        required: false
+        default: "350"
+
+concurrency:
+  group: linux-desktop-6h
+  cancel-in-progress: false
+
+env:
+  TS_HOSTNAME: linux-desktop
+  RDP_USER: rdpuser
+
+jobs:
+  build:
+    name: "Ubuntu desktop (XFCE + xrdp)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: "1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+          # NEW: اعتبارسنجی رمز root
+          if [ -z "${ROOT_PASSWORD:-}" ]; then
+            echo "::error::Secret ROOT_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#ROOT_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز root باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+          if [ "${ROOT_PASSWORD}" = "${RDP_PASSWORD}" ]; then
+            echo "::error::رمز root و rdpuser نباید یکی باشند."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # NEW: رمز root و فعال‌سازی ورود root در xrdp
+          sudo chpasswd <<< "root:${ROOT_PASSWORD}"
+
+          SES=/etc/xrdp/sesman.ini
+          if [ ! -f "$SES" ]; then
+            echo "::error::$SES پیدا نشد — نصب xrdp ناقص است."
+            exit 1
+          fi
+          # اگر خط وجود دارد مقدارش را true کن، وگرنه زیر [Security] اضافه کن
+          sudo sed -i -E 's/^[#[:space:]]*AllowRootLogin=.*/AllowRootLogin=true/' "$SES"
+          if ! grep -q '^AllowRootLogin=' "$SES"; then
+            sudo sed -i '/^\[Security\]/a AllowRootLogin=true' "$SES"
+          fi
+          # اگر لیست محدودیت کاربری ست شده، خالی کن تا root و rdpuser مجاز باشند
+          sudo sed -i -E 's/^[#[:space:]]*TerminalServerUsers=.*/TerminalServerUsers=/' "$SES"
+          sudo sed -i -E 's/^[#[:space:]]*TerminalServerAdmins=.*/TerminalServerAdmins=/' "$SES"
+          echo "--- تنظیمات امنیتی sesman.ini ---"
+          sudo grep -E '^(AllowRootLogin|TerminalServerUsers|TerminalServerAdmins)=' "$SES" || true
+
+          # --- بسته‌ها
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای rdpuser
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # NEW: نشست XFCE برای root (startwm.sh مشترک است ولی .xsession را هم می‌گذاریم)
+          echo "xfce4-session" | sudo tee /root/.xsession >/dev/null
+          sudo chmod 644 /root/.xsession
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه + کار برای root و rdpuser)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          # --- xrdp: راه‌اندازی نشست XFCE (برای هر کاربر از جمله root)
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+
+          export XDG_SESSION_TYPE=x11
+          export XDG_SESSION_DESKTOP=xfce
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_CONFIG_DIRS=/etc/xdg
+          export XDG_DATA_DIRS=/usr/local/share:/usr/share
+          export SHELL=/bin/bash
+
+          if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "${XDG_RUNTIME_DIR:-}" ]; then
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          fi
+          if [ ! -d "$XDG_RUNTIME_DIR" ]; then
+            export XDG_RUNTIME_DIR="$HOME/.xdg-runtime"
+            mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          fi
+
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset SESSION_MANAGER
+
+          if command -v dbus-run-session >/dev/null 2>&1 && [ -x /usr/bin/xfce4-session ]; then
+            exec dbus-run-session -- /usr/bin/xfce4-session
+          elif [ -x /usr/bin/xfce4-session ]; then
+            exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          else
+            exec dbus-run-session -- sh -c '/usr/bin/xfwm4 & /usr/bin/xfce4-panel & wait'
+          fi
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q ':3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "1b) تست خودکار RDP (اختیاری، بی‌خطر)"
+        continue-on-error: true
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
+        run: |
+          set +e
+          if ! sudo apt-get install -y -qq freerdp2-x11 xvfb >/dev/null 2>&1; then
+            sudo apt-get install -y -qq freerdp-x11 xvfb >/dev/null 2>&1 \
+              || { echo 'کلاینت تست نصب نشد — از این تست رد شدم'; exit 0; }
+          fi
+
+          test_auth() {
+            local user="$1" pass="$2"
+            local out rc
+            out=$(timeout 120 xvfb-run -a xfreerdp /v:127.0.0.1 /u:"$user" \
+                    /p:"$pass" /cert:ignore /timeout:30000 +auth-only 2>&1)
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "✔ auth $user: پذیرفته شد"
+            else
+              echo "✘ auth $user ناموفق (rc=$rc)"
+              echo "$out" | tail -n 10
+            fi
+          }
+
+          test_session() {
+            local user="$1" pass="$2"
+            pkill -f xfreerdp >/dev/null 2>&1
+            sleep 1
+            timeout 70 xvfb-run -a xfreerdp /v:127.0.0.1 /u:"$user" \
+              /p:"$pass" /cert:ignore /size:1024x768 >/tmp/rdp-session.log 2>&1 &
+            for i in $(seq 1 50); do
+              sleep 1
+              pgrep -u "$user" -x xfwm4 >/dev/null 2>&1 && return 0
+            done
+            return 1
+          }
+
+          cleanup_sessions() {
+            for U in "${RDP_USER}" root; do
+              for p in xfce4-session xfwm4 xfsettingsd xfce4-panel xfdesktop xrdp-chansrv; do
+                sudo pkill -u "$U" -x "$p" >/dev/null 2>&1 || true
+              done
+              sudo pkill -u "$U" -f xvfb >/dev/null 2>&1 || true
+            done
+            sudo rm -f /tmp/.X*-lock >/dev/null 2>&1 || true
+            sudo systemctl restart xrdp xrdp-sesman >/dev/null 2>&1 || true
+            sleep 3
+          }
+
+          # ── تست rdpuser
+          test_auth "${RDP_USER}" "${RDP_PASSWORD}"
+          if test_session "${RDP_USER}" "${RDP_PASSWORD}"; then
+            echo '✔ rdpuser: نشست XFCE بالا آمد'
+          else
+            echo '✘ rdpuser: نشست بالا نیامد'
+            tail -n 15 /tmp/rdp-session.log
+          fi
+          cleanup_sessions
+
+          # ── تست root
+          test_auth root "${ROOT_PASSWORD}"
+          if test_session root "${ROOT_PASSWORD}"; then
+            echo '✔ root: نشست XFCE بالا آمد'
+          else
+            echo '✘ root: نشست بالا نیامد — AllowRootLogin یا رمز root را بررسی کن'
+            tail -n 15 /tmp/rdp-session.log
+            sudo grep -E '^AllowRootLogin=' /etc/xrdp/sesman.ini || true
+          fi
+
+          pkill -f xfreerdp >/dev/null 2>&1
+          cleanup_sessions
+          echo '— تست تمام شد؛ هر دو نشست پاک شدند —'
+          exit 0
+
+      - name: "2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --ssh \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Users        : rdpuser / root"
+          echo "   Passwords    : (Secrets RDP_PASSWORD / ROOT_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### ماشین بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Users | \`rdpuser\` / \`root\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "برای اتصال: mstsc /v:<IP> — کاربر rdpuser یا root"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "3) زنده نگه داشتن (۶ ساعت)"
+        env:
+          MINUTES_INPUT: ${{ inputs.duration_minutes }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-350}
+          case "$M" in ''|*[!0-9]*) M=350 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          # NEW: پاکسازی نشست‌های باقی‌مانده برای هر دو کاربر
+          for U in "${RDP_USER}" root; do
+            for p in xfce4-session xfwm4 xfsettingsd xfce4-panel xfdesktop xrdp-chansrv; do
+              sudo pkill -u "$U" -x "$p" >/dev/null 2>&1 || true
+            done
+          done
+          sudo rm -f /tmp/.X*-lock >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp xrdp-sesman >/dev/null 2>&1 || true
+          sleep 2
+          echo "ماشین برای $M دقیقه روشن می‌ماند. این اجرا را Cancel نکن."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              if ! sudo grep -q '^AllowRootLogin=true' /etc/xrdp/sesman.ini; then
+                echo "[$i/$M] هشدار: AllowRootLogin از دست رفته — بازنویسی"
+                sudo sed -i -E 's/^[#[:space:]]*AllowRootLogin=.*/AllowRootLogin=true/' /etc/xrdp/sesman.ini
+                sudo systemctl restart xrdp xrdp-sesman >/dev/null 2>&1 || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "زمان تمام شد؛ ماشین خاموش می‌شود."
